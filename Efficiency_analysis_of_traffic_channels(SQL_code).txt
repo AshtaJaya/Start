@@ -1,0 +1,90 @@
+with currency_rates_correct_date as -- переводим дату в правильный формат
+    (
+    select 
+        c.date::date crt_date,
+        c.usd_to_rub
+    from gd1.currency_rates c
+    ),
+    
+
+    mrkt_costs_corrected as -- название источника будет писаться строчными буквами
+    (                       -- как в таблице sessions_acquisition  
+    select
+        m.date::date cohort_date, --алиас для названия столбца
+        lower(m.source) source,
+        m.medium,
+        m.campaign,
+        m.costs_rub
+    from gd1.marketing_costs m
+    ),
+    
+    
+    transactions_rub as --переводим суммы транзакций в рубли
+    (
+    select
+        t.id,
+        t.created_at,
+        t.uuid,
+        t.subtotal_cents::numeric*usd_to_rub::numeric/100 subtotal_rub,
+        t.total_cents::numeric*usd_to_rub::numeric/100 total_rub
+    from gd1.transactions t join currency_rates_correct_date c on t.created_at::date=c.crt_date  
+    ),
+    
+    
+    transactions_with_acq_info as --создаём таблицу с информацией о дате транзакций, рекламных кампаниях и скидках,
+    (                             --полученных клиентом в первые 30 дней пользования продуктом 
+    select   
+        t.created_at::date transaction_date,
+        t.subtotal_rub,
+        (t.subtotal_rub-t.total_rub) discount,
+        sa.start_at first_transaction_date,
+        sa.source,
+        sa.medium,
+        sa.campaign,
+        t.id
+    from transactions_rub t join
+         gd1.sessions_acquisition sa using(uuid) 
+         where (t.created_at-sa.start_at)::integer<=30
+    ),
+    
+    
+    data_per_cohort as --таблица по когортам по дате первой транзакции
+    (
+    select
+        twai.first_transaction_date cohort_date,
+        twai.source,
+        twai.medium,
+        twai.campaign,
+        sum(twai.discount) discounts,
+        sum(twai.subtotal_rub) income
+    from transactions_with_acq_info twai join mrkt_costs_corrected mcc 
+			--оставляем только рекламные кампании из таблицы mcc, чтобы рассматривать только платную рекламу
+
+        on twai.first_transaction_date=mcc.cohort_date and twai.source=mcc.source 
+        and twai.medium=mcc.medium and twai.campaign=mcc.campaign
+    group by 1,2,3,4
+    order by 1,2,3,4
+    ),
+    
+    
+    ltv_30_days as
+    (
+    select
+        dpc.cohort_date,
+        dpc.source,
+        dpc.medium,
+        dpc.campaign,
+        dpc.income,
+        dpc.discounts,
+        mcc.costs_rub,
+        dpc.income-(dpc.discounts+mcc.costs_rub) ltv
+    from data_per_cohort dpc join mrkt_costs_corrected mcc
+        on dpc.cohort_date=mcc.cohort_date and dpc.source=mcc.source
+        and dpc.medium=mcc.medium and dpc.campaign=mcc.campaign
+    )
+        
+    
+    select *
+    from ltv_30_days
+    order by 1
+    
